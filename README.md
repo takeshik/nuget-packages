@@ -8,13 +8,13 @@ Stable releases continue to ship from [NuGet.org](https://www.nuget.org/).
 ## Feed URL
 
 ```
-https://takeshik.github.io/nuget-packages/feed/index.json
+https://nuget.tksk.io/feed/index.json
 ```
 
 ## Adding this feed
 
 ```bash
-dotnet nuget add source https://takeshik.github.io/nuget-packages/feed/index.json -n takeshik-prerelease
+dotnet nuget add source https://nuget.tksk.io/feed/index.json -n takeshik
 ```
 
 Or add to your `nuget.config`:
@@ -23,8 +23,8 @@ Or add to your `nuget.config`:
 <?xml version="1.0" encoding="utf-8"?>
 <configuration>
   <packageSources>
-    <add key="takeshik-prerelease"
-         value="https://takeshik.github.io/nuget-packages/feed/index.json" />
+    <add key="takeshik"
+         value="https://nuget.tksk.io/feed/index.json" />
   </packageSources>
 </configuration>
 ```
@@ -45,17 +45,19 @@ If no target has new versions, the workflow exits early without deploying.
 
 ## Adding a new target
 
-Add a file at `.feeds/<id>.json`:
+Add a file at `.feeds/<source>.json`:
 
 ```json
 {
-  "id": "my-library",
-  "packageIds": ["MyLibrary", "MyLibrary.Extensions"]
+  "packageIds": ["MyLibrary", "MyLibrary.Extensions"],
+  "repositoryUrl": "https://github.com/takeshik/my-library"
 }
 ```
 
 The workflow automatically discovers all `.feeds/*.json` files. `packageIds` must
-match the NuGet package IDs as published to GitHub Packages.
+match the NuGet package IDs as published to GitHub Packages. `repositoryUrl` is
+used to link the source ID from the generated landing page, and the source ID
+itself is derived from the filename.
 
 ## Repository setup
 

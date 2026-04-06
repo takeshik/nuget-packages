@@ -148,7 +148,7 @@ runs:
           jq -r '
             sort_by(.id)
             | map(
-                "<tr><td><strong>\(.id)</strong></td>" +
+                "<tr><td><strong><a href=\"" + (.repositoryUrl | @html) + "\">" + (.id | @html) + "</a></strong></td>" +
                 "<td>" + (.packageIds | join(", ")) + "</td>" +
                 "<td>\(.publishedAt)</td></tr>"
               )
@@ -197,12 +197,12 @@ runs:
             Stable releases are on <a href="https://www.nuget.org/">NuGet.org</a>.
           </p>
           <h2>Add this feed</h2>
-          <pre><code>dotnet nuget add source ${FEED_BASE_URL}/index.json -n takeshik-prerelease</code></pre>
+          <pre><code>dotnet nuget add source ${FEED_BASE_URL}/index.json -n takeshik</code></pre>
           <p>Or add to your <code>nuget.config</code>:</p>
           <pre><code>&lt;?xml version="1.0" encoding="utf-8"?&gt;
         &lt;configuration&gt;
           &lt;packageSources&gt;
-            &lt;add key="takeshik-prerelease" value="${FEED_BASE_URL}/index.json" /&gt;
+            &lt;add key="takeshik" value="${FEED_BASE_URL}/index.json" /&gt;
           &lt;/packageSources&gt;
         &lt;/configuration&gt;</code></pre>
           <h2>Sources</h2>

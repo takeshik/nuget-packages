@@ -14,7 +14,7 @@ env:
   DOTNET_NOLOGO: true
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
-  FEED_BASE_URL: https://takeshik.github.io/nuget-packages/feed
+  FEED_BASE_URL: https://nuget.tksk.io/feed
 
 permissions:
   contents: read
@@ -144,7 +144,8 @@ jobs:
           changed=false
 
           for config_file in .feeds/*.json; do
-            id="$(jq -r '.id' "$config_file")"
+            id="${config_file##*/}"
+            id="${id%.json}"
             target_new_versions='{}'
             target_has_new=false
 
@@ -224,8 +225,9 @@ jobs:
                 jq -cn \
                   --arg id "$id" \
                   --argjson packageIds "$(jq '.packageIds' "$config_file")" \
+                  --arg repositoryUrl "$(jq -er '.repositoryUrl' "$config_file")" \
                   --argjson newVersions "$target_new_versions" \
-                  '{id: $id, packageIds: $packageIds, newVersions: $newVersions}'
+                  '{id: $id, packageIds: $packageIds, repositoryUrl: $repositoryUrl, newVersions: $newVersions}'
               )"
               matrix_items="$(printf '%s' "$matrix_items" | jq -c --argjson item "$item" '. + [$item]')"
               echo "::notice::Queued ${id} for publish."
@@ -277,14 +279,16 @@ jobs:
         env:
           TARGET_ID: ${{ matrix.target.id }}
           TARGET_PACKAGE_IDS: ${{ toJson(matrix.target.packageIds) }}
+          TARGET_REPOSITORY_URL: ${{ matrix.target.repositoryUrl }}
           METADATA_DIR: ${{ runner.temp }}/metadata
         run: |
           mkdir -p "$METADATA_DIR"
           jq -n \
             --arg id "$TARGET_ID" \
             --argjson packageIds "$TARGET_PACKAGE_IDS" \
+            --arg repositoryUrl "$TARGET_REPOSITORY_URL" \
             --arg publishedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{id: $id, packageIds: $packageIds, publishedAt: $publishedAt}' \
+            '{id: $id, packageIds: $packageIds, repositoryUrl: $repositoryUrl, publishedAt: $publishedAt}' \
             > "${METADATA_DIR}/${TARGET_ID}.json"
 
       - name: Upload packages artifact
@@ -346,7 +350,8 @@ jobs:
           mkdir -p "$METADATA_DIR"
 
           for config_file in .feeds/*.json; do
-            id="$(jq -r '.id' "$config_file")"
+            id="${config_file##*/}"
+            id="${id%.json}"
             meta_file="${METADATA_DIR}/${id}.json"
             if [ ! -f "$meta_file" ]; then
               echo "Fetching existing metadata for unchanged target: ${id}"
