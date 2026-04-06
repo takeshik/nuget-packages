@@ -1,0 +1,219 @@
+name: Publish Static NuGet Feed
+description: >
+  Merges newly packed .nupkg files into an existing static NuGet V3 feed hosted
+  on GitHub Pages, applies version retention, and generates a landing page.
+
+inputs:
+  feed-base-url:
+    description: >
+      Public base URL of the static feed, without a trailing slash.
+      Example: https://takeshik.github.io/nuget-packages/feed
+    required: true
+  feed-name:
+    description: Human-readable name shown on the landing page.
+    required: true
+  packages-path:
+    description: Directory containing the .nupkg files to publish.
+    required: true
+  metadata-path:
+    description: >
+      Directory containing per-target metadata JSON files ({id}.json).
+      Used to populate the landing page source list.
+    required: true
+  output-path:
+    description: >
+      Directory where the complete site will be written.
+      The NuGet feed is placed under {output-path}/feed/;
+      the landing page is written to {output-path}/index.html.
+    required: true
+  package-ids:
+    description: >
+      Newline-delimited list of all managed package IDs.
+      Used to download existing versions from the live feed before merging.
+    required: true
+  retain-stable:
+    description: Number of most-recent stable versions to keep per package ID.
+    required: false
+    default: '3'
+  retain-prerelease:
+    description: Number of most-recent prerelease versions to keep per package ID.
+    required: false
+    default: '30'
+
+outputs:
+  feed-path:
+    description: Path to the directory containing the generated NuGet feed.
+    value: ${{ steps.render.outputs.feed-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install Sleet
+      shell: bash
+      run: dotnet tool install --tool-path "$RUNNER_TEMP/sleet-bin" sleet
+
+    - name: Render feed
+      id: render
+      shell: bash
+      env:
+        FEED_BASE_URL: ${{ inputs.feed-base-url }}
+        FEED_NAME: ${{ inputs.feed-name }}
+        PACKAGES_PATH: ${{ inputs.packages-path }}
+        METADATA_PATH: ${{ inputs.metadata-path }}
+        OUTPUT_PATH: ${{ inputs.output-path }}
+        PACKAGE_IDS: ${{ inputs.package-ids }}
+        RETAIN_STABLE: ${{ inputs.retain-stable }}
+        RETAIN_PRERELEASE: ${{ inputs.retain-prerelease }}
+      run: |
+        set -euo pipefail
+
+        sleet="$RUNNER_TEMP/sleet-bin/sleet"
+        feed_dir="$OUTPUT_PATH/feed"
+        combined_dir="$RUNNER_TEMP/combined-packages"
+
+        mkdir -p "$feed_dir" "$combined_dir"
+
+        # Copy new packages into the combined directory.
+        find "$PACKAGES_PATH" -maxdepth 1 -name '*.nupkg' -exec cp -n {} "$combined_dir/" \;
+
+        # Download existing packages from the live feed so that the full version
+        # history (up to the retention limit) is preserved across deployments.
+        index_json="$(curl -fsSL "${FEED_BASE_URL}/index.json" 2>/dev/null || true)"
+        if [ -n "$index_json" ]; then
+          package_base="$(
+            printf '%s' "$index_json" \
+              | jq -r '.resources[] | select(."@type" == "PackageBaseAddress/3.0.0") | ."@id"' \
+              | head -n1
+          )"
+
+          if [ -n "$package_base" ] && [ "$package_base" != "null" ]; then
+            while IFS= read -r pkg_id; do
+              [ -n "$pkg_id" ] || continue
+              lower_id="$(printf '%s' "$pkg_id" | tr '[:upper:]' '[:lower:]')"
+              versions="$(
+                curl -fsSL "${package_base}${lower_id}/index.json" 2>/dev/null \
+                  | jq -r '.versions[]?' \
+                  || true
+              )"
+
+              while IFS= read -r version; do
+                [ -n "$version" ] || continue
+                dest="$combined_dir/${pkg_id}.${version}.nupkg"
+                [ -f "$dest" ] && continue  # new build takes precedence
+                curl -fsSL \
+                  "${package_base}${lower_id}/${version}/${lower_id}.${version}.nupkg" \
+                  -o "$dest" \
+                  || true
+              done <<< "$versions"
+            done <<< "$PACKAGE_IDS"
+          fi
+        fi
+
+        # Write a Sleet configuration pointing to the local feed directory.
+        cat > "$RUNNER_TEMP/sleet.json" << EOF
+        {
+          "sources": [
+            {
+              "name": "feed",
+              "type": "local",
+              "path": "${feed_dir}",
+              "baseURI": "${FEED_BASE_URL}/"
+            }
+          ]
+        }
+        EOF
+
+        "$sleet" init    --config "$RUNNER_TEMP/sleet.json" --source feed
+        "$sleet" push    --config "$RUNNER_TEMP/sleet.json" --source feed --skip-existing "$combined_dir"
+        "$sleet" retention prune \
+                         --config "$RUNNER_TEMP/sleet.json" --source feed \
+                         --stable "$RETAIN_STABLE" --prerelease "$RETAIN_PRERELEASE"
+        "$sleet" validate --config "$RUNNER_TEMP/sleet.json" --source feed
+
+        # Copy per-target metadata so the next run can detect unchanged targets.
+        mkdir -p "$feed_dir/sources"
+        find "$METADATA_PATH" -maxdepth 1 -name '*.json' -type f \
+          -exec cp {} "$feed_dir/sources/" \;
+
+        # Build the source list markup for the landing page.
+        sources_index="$feed_dir/sources/index.json"
+        mapfile -t meta_files < <(find "$METADATA_PATH" -maxdepth 1 -name '*.json' -type f | sort)
+        if [ ${#meta_files[@]} -gt 0 ]; then
+          jq -s '.' "${meta_files[@]}" > "$sources_index"
+        else
+          echo '[]' > "$sources_index"
+        fi
+
+        source_rows="$(
+          jq -r '
+            sort_by(.id)
+            | map(
+                "<tr><td><strong>\(.id)</strong></td>" +
+                "<td>" + (.packageIds | join(", ")) + "</td>" +
+                "<td>\(.publishedAt)</td></tr>"
+              )
+            | join("\n")
+          ' "$sources_index"
+        )"
+
+        # Generate the landing page.
+        cat > "$OUTPUT_PATH/index.html" << HTMLEOF
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>${FEED_NAME}</title>
+          <style>
+            :root { color-scheme: light; }
+            body {
+              font-family: system-ui, -apple-system, sans-serif;
+              max-width: 720px; margin: 2rem auto; padding: 0 1.25rem;
+              color: #1f2328; background: #ffffff;
+            }
+            h1 { font-size: 1.6rem; margin-bottom: 0.25rem; }
+            p { color: #57606a; }
+            code {
+              font-family: "SFMono-Regular", Consolas, monospace;
+              font-size: 0.875em;
+              background: #f6f8fa; padding: 0.15em 0.4em; border-radius: 4px;
+            }
+            pre {
+              background: #f6f8fa; border: 1px solid #d0d7de;
+              border-radius: 6px; padding: 0.9rem 1rem; overflow-x: auto;
+            }
+            pre code { background: none; padding: 0; }
+            table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+            th { text-align: left; border-bottom: 2px solid #d0d7de; padding: 0.4rem 0.6rem; }
+            td { border-bottom: 1px solid #d0d7de; padding: 0.4rem 0.6rem; color: #57606a; }
+            td:first-child { color: #1f2328; }
+          </style>
+        </head>
+        <body>
+          <h1>${FEED_NAME}</h1>
+          <p>
+            Public prerelease feed, mirrored from
+            <a href="https://github.com/takeshik?tab=packages">GitHub Packages</a>.
+            Stable releases are on <a href="https://www.nuget.org/">NuGet.org</a>.
+          </p>
+          <h2>Add this feed</h2>
+          <pre><code>dotnet nuget add source ${FEED_BASE_URL}/index.json -n takeshik-prerelease</code></pre>
+          <p>Or add to your <code>nuget.config</code>:</p>
+          <pre><code>&lt;?xml version="1.0" encoding="utf-8"?&gt;
+        &lt;configuration&gt;
+          &lt;packageSources&gt;
+            &lt;add key="takeshik-prerelease" value="${FEED_BASE_URL}/index.json" /&gt;
+          &lt;/packageSources&gt;
+        &lt;/configuration&gt;</code></pre>
+          <h2>Sources</h2>
+          <table>
+            <thead><tr><th>ID</th><th>Packages</th><th>Published</th></tr></thead>
+            <tbody>
+        ${source_rows}
+            </tbody>
+          </table>
+        </body>
+        </html>
+        HTMLEOF
+
+        echo "feed-path=${feed_dir}" >> "$GITHUB_OUTPUT"

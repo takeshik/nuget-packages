@@ -1,0 +1,389 @@
+name: Publish Feeds
+
+on:
+  schedule:
+    - cron: '0 20 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild all targets regardless of whether new versions are available
+        type: boolean
+        default: false
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  FEED_BASE_URL: https://takeshik.github.io/nuget-packages/feed
+
+permissions:
+  contents: read
+  packages: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+
+  # ──────────────────────────────────────────────
+  # Resolve which targets have new versions to publish.
+  # ──────────────────────────────────────────────
+  resolve:
+    name: Resolve changed targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      changed: ${{ steps.build-matrix.outputs.changed }}
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build change matrix
+        id: build-matrix
+        shell: bash
+        env:
+          FORCE: ${{ inputs.force || 'false' }}
+          GH_PACKAGES_SOURCE: https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
+          GITHUB_TOKEN: ${{ github.token }}
+          FEED_BASE_URL: ${{ env.FEED_BASE_URL }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          fetch_json() {
+            local url="$1"
+            local body_file
+            local http_code
+            body_file="$(mktemp)"
+            http_code="$(
+              curl -sSL \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -o "$body_file" \
+                -w '%{http_code}' \
+                "$url"
+            )"
+
+            case "$http_code" in
+              200)
+                if ! jq -e . "$body_file" >/dev/null 2>&1; then
+                  echo "::error::Expected JSON from ${url}, but received non-JSON content." >&2
+                  rm -f "$body_file"
+                  return 1
+                fi
+                cat "$body_file"
+                rm -f "$body_file"
+                ;;
+              401|403)
+                echo "::error::GitHub Packages request failed with HTTP ${http_code}. Grant this repository access to the package, or use a PAT with read:packages." >&2
+                rm -f "$body_file"
+                return 1
+                ;;
+              404)
+                rm -f "$body_file"
+                return 4
+                ;;
+              *)
+                echo "::error::GitHub Packages request failed with HTTP ${http_code}: ${url}" >&2
+                rm -f "$body_file"
+                return 1
+                ;;
+            esac
+          }
+
+          source_index_json="$(fetch_json "${GH_PACKAGES_SOURCE}")"
+
+          registration_base="$(
+            printf '%s' "$source_index_json" \
+              | jq -r '
+                  .resources[]
+                  | select(."@type" | startswith("RegistrationsBaseUrl/"))
+                  | ."@id"
+                ' \
+              | head -n1
+          )"
+
+          if [ -z "$registration_base" ] || [ "$registration_base" = "null" ]; then
+            echo "::error::GitHub Packages source does not expose a RegistrationsBaseUrl resource: ${GH_PACKAGES_SOURCE}" >&2
+            exit 1
+          fi
+          registration_base="${registration_base%/}/"
+
+          fetch_registration_entries() {
+            local package_id="$1"
+            local lower_id
+            local root_json
+            local entries='[]'
+            local inline_items
+            local page_url
+            local page_payload
+            lower_id="$(printf '%s' "$package_id" | tr '[:upper:]' '[:lower:]')"
+            root_json="$(fetch_json "${registration_base}${lower_id}/index.json")" || return $?
+
+            while IFS= read -r page_json; do
+              [ -n "$page_json" ] || continue
+
+              inline_items="$(printf '%s' "$page_json" | jq -c '.items // []')"
+              if [ "$inline_items" = '[]' ]; then
+                page_url="$(printf '%s' "$page_json" | jq -r '."@id" // empty')"
+                [ -n "$page_url" ] || continue
+                page_payload="$(fetch_json "$page_url")" || return $?
+                inline_items="$(printf '%s' "$page_payload" | jq -c '.items // []')"
+              fi
+
+              entries="$(jq -cn --argjson acc "$entries" --argjson items "$inline_items" '$acc + $items')"
+            done < <(printf '%s' "$root_json" | jq -c '.items[]?')
+
+            printf '%s' "$entries"
+          }
+
+          matrix_items='[]'
+          changed=false
+
+          for config_file in .feeds/*.json; do
+            id="$(jq -r '.id' "$config_file")"
+            target_new_versions='{}'
+            target_has_new=false
+
+            while IFS= read -r pkg_id; do
+              lower_id="$(printf '%s' "$pkg_id" | tr '[:upper:]' '[:lower:]')"
+
+              # Versions available in GitHub Packages (authentication required).
+              source_entries='[]'
+              if source_entries="$(fetch_registration_entries "$pkg_id")"; then
+                :
+              else
+                rc=$?
+                if [ "$rc" -eq 4 ]; then
+                  echo "::notice::No versions found for ${pkg_id} in GitHub Packages — skipping."
+                  continue
+                fi
+                exit "$rc"
+              fi
+
+              source_versions="$(
+                printf '%s' "$source_entries" \
+                  | jq -r '.[].catalogEntry.version? // empty' \
+                  | sort -u
+              )"
+
+              if [ -z "$source_versions" ]; then
+                echo "::notice::No versions found for ${pkg_id} in GitHub Packages — skipping."
+                continue
+              fi
+
+              # Versions already published to the static feed (no auth needed).
+              static_versions="$(
+                curl -fsSL \
+                  "${FEED_BASE_URL}/flatcontainer/${lower_id}/index.json" 2>/dev/null \
+                  | jq -r '.versions[]?' 2>/dev/null \
+                  | sort \
+                  || true
+              )"
+
+              if [ "$FORCE" = 'true' ]; then
+                new_versions="$source_versions"
+              else
+                new_versions="$(
+                  comm -23 \
+                    <(printf '%s\n' "$source_versions") \
+                    <(printf '%s\n' "$static_versions") \
+                    || true
+                )"
+              fi
+
+              if [ -n "$new_versions" ]; then
+                target_has_new=true
+                versions_json="$(
+                  printf '%s' "$source_entries" \
+                    | jq -c --argjson versions "$(printf '%s\n' "$new_versions" | jq -R . | jq -s .)" '
+                        [
+                          .[]
+                          | select(.catalogEntry.version as $v | $versions | index($v))
+                          | {
+                              version: .catalogEntry.version,
+                              packageContent: .packageContent
+                            }
+                        ]
+                      '
+                )"
+                target_new_versions="$(
+                  printf '%s' "$target_new_versions" \
+                    | jq -c --arg pkg "$pkg_id" --argjson vers "$versions_json" \
+                         '. + {($pkg): $vers}'
+                )"
+              fi
+            done < <(jq -r '.packageIds[]' "$config_file")
+
+            if [ "$target_has_new" = 'true' ]; then
+              changed=true
+              item="$(
+                jq -cn \
+                  --arg id "$id" \
+                  --argjson packageIds "$(jq '.packageIds' "$config_file")" \
+                  --argjson newVersions "$target_new_versions" \
+                  '{id: $id, packageIds: $packageIds, newVersions: $newVersions}'
+              )"
+              matrix_items="$(printf '%s' "$matrix_items" | jq -c --argjson item "$item" '. + [$item]')"
+              echo "::notice::Queued ${id} for publish."
+            else
+              echo "::notice::Skipping ${id}: no new versions."
+            fi
+          done
+
+          echo "changed=${changed}" >> "$GITHUB_OUTPUT"
+          printf 'matrix=%s\n' "$matrix_items" >> "$GITHUB_OUTPUT"
+
+  # ──────────────────────────────────────────────
+  # Download new .nupkg files from GitHub Packages.
+  # One job per changed target (parallel).
+  # ──────────────────────────────────────────────
+  download:
+    name: Download ${{ matrix.target.id }}
+    needs: resolve
+    if: needs.resolve.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.resolve.outputs.matrix) }}
+    steps:
+      - name: Download new packages from GitHub Packages
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TARGET_NEW_VERSIONS: ${{ toJson(matrix.target.newVersions) }}
+          PACKAGES_DIR: ${{ runner.temp }}/packages
+        run: |
+          set -euo pipefail
+          mkdir -p "$PACKAGES_DIR"
+
+          printf '%s' "$TARGET_NEW_VERSIONS" \
+            | jq -r 'to_entries[] | .key as $pkg | .value[] | [$pkg, .version, .packageContent] | @tsv' \
+            | while IFS=$'\t' read -r pkg_id version url; do
+                echo "Downloading ${pkg_id} ${version}..."
+                curl -fsSL \
+                  -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                  "$url" \
+                  -o "${PACKAGES_DIR}/${pkg_id}.${version}.nupkg"
+              done
+
+      - name: Write target metadata
+        shell: bash
+        env:
+          TARGET_ID: ${{ matrix.target.id }}
+          TARGET_PACKAGE_IDS: ${{ toJson(matrix.target.packageIds) }}
+          METADATA_DIR: ${{ runner.temp }}/metadata
+        run: |
+          mkdir -p "$METADATA_DIR"
+          jq -n \
+            --arg id "$TARGET_ID" \
+            --argjson packageIds "$TARGET_PACKAGE_IDS" \
+            --arg publishedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{id: $id, packageIds: $packageIds, publishedAt: $publishedAt}' \
+            > "${METADATA_DIR}/${TARGET_ID}.json"
+
+      - name: Upload packages artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.target.id }}
+          path: ${{ runner.temp }}/packages/*.nupkg
+          if-no-files-found: error
+
+      - name: Upload metadata artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: metadata-${{ matrix.target.id }}
+          path: ${{ runner.temp }}/metadata/${{ matrix.target.id }}.json
+          if-no-files-found: error
+
+  # ──────────────────────────────────────────────
+  # Merge all packages into the static feed and deploy to GitHub Pages.
+  # ──────────────────────────────────────────────
+  publish:
+    name: Publish feed
+    needs: [resolve, download]
+    if: needs.resolve.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Download packages artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          path: ${{ runner.temp }}/packages
+          merge-multiple: true
+
+      - name: Download metadata artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: metadata-*
+          path: ${{ runner.temp }}/metadata
+          merge-multiple: true
+
+      - name: Fetch metadata for unchanged targets
+        shell: bash
+        env:
+          FEED_BASE_URL: ${{ env.FEED_BASE_URL }}
+          METADATA_DIR: ${{ runner.temp }}/metadata
+        run: |
+          set -euo pipefail
+          mkdir -p "$METADATA_DIR"
+
+          for config_file in .feeds/*.json; do
+            id="$(jq -r '.id' "$config_file")"
+            meta_file="${METADATA_DIR}/${id}.json"
+            if [ ! -f "$meta_file" ]; then
+              echo "Fetching existing metadata for unchanged target: ${id}"
+              curl -fsSL "${FEED_BASE_URL}/sources/${id}.json" -o "$meta_file" || true
+            fi
+          done
+
+      - name: Collect all package IDs
+        id: package-ids
+        shell: bash
+        run: |
+          {
+            echo 'package-ids<<EOF'
+            jq -r '.packageIds[]' .feeds/*.json | sort -u
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish feed
+        uses: ./.github/actions/publish-feed
+        with:
+          feed-base-url: ${{ env.FEED_BASE_URL }}
+          feed-name: "takeshik/nuget-packages"
+          packages-path: ${{ runner.temp }}/packages
+          metadata-path: ${{ runner.temp }}/metadata
+          output-path: ${{ runner.temp }}/site
+          package-ids: ${{ steps.package-ids.outputs.package-ids }}
+          retain-stable: '3'
+          retain-prerelease: '30'
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/site
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
