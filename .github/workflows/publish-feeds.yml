@@ -292,14 +292,14 @@ jobs:
             > "${METADATA_DIR}/${TARGET_ID}.json"
 
       - name: Upload packages artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: packages-${{ matrix.target.id }}
           path: ${{ runner.temp }}/packages/*.nupkg
           if-no-files-found: error
 
       - name: Upload metadata artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: metadata-${{ matrix.target.id }}
           path: ${{ runner.temp }}/metadata/${{ matrix.target.id }}.json
@@ -327,14 +327,14 @@ jobs:
           dotnet-version: 10.0.x
 
       - name: Download packages artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: packages-*
           path: ${{ runner.temp }}/packages
           merge-multiple: true
 
       - name: Download metadata artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: metadata-*
           path: ${{ runner.temp }}/metadata
