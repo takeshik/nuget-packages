@@ -1,4 +1,9 @@
 {
-  "packageIds": ["Duets", "HttpHarker"],
+  "packageIds": [
+    "Duets",
+    "Duets.Jint",
+    "Duets.Okojo",
+    "HttpHarker"
+  ],
   "repositoryUrl": "https://github.com/takeshik/Duets"
 }
