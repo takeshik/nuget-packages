@@ -15,6 +15,8 @@ env:
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
   FEED_BASE_URL: https://nuget.tksk.io/feed
+  RETAIN_STABLE: '3'
+  RETAIN_PRERELEASE: '30'
 
 permissions:
   contents: read
@@ -50,6 +52,9 @@ jobs:
           GH_PACKAGES_SOURCE: https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
           GITHUB_TOKEN: ${{ github.token }}
           FEED_BASE_URL: ${{ env.FEED_BASE_URL }}
+          RETAIN_STABLE: ${{ env.RETAIN_STABLE }}
+          RETAIN_PRERELEASE: ${{ env.RETAIN_PRERELEASE }}
+          PUBLICATION_METADATA_PATH: ${{ runner.temp }}/publication-metadata.json
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -141,6 +146,7 @@ jobs:
           }
 
           matrix_items='[]'
+          publication_metadata='{}'
           changed=false
 
           for config_file in .feeds/*.json; do
@@ -165,8 +171,51 @@ jobs:
                 exit "$rc"
               fi
 
-              source_versions="$(
+              # Registration entries are ordered by NuGet version. Compare only
+              # the versions that survive retention; otherwise pruned versions
+              # look new again on every run.
+              retained_source_entries="$(
                 printf '%s' "$source_entries" \
+                  | jq -c \
+                      --argjson retain_stable "$RETAIN_STABLE" \
+                      --argjson retain_prerelease "$RETAIN_PRERELEASE" '
+                        def take_last($count):
+                          if $count <= 0 then []
+                          elif length > $count then .[-$count:]
+                          else .
+                          end;
+
+                        ([.[] | select(.catalogEntry.version | contains("-") | not)]
+                          | take_last($retain_stable))
+                        +
+                        ([.[] | select(.catalogEntry.version | contains("-"))]
+                          | take_last($retain_prerelease))
+                      '
+              )"
+
+              package_publication_metadata="$(
+                printf '%s' "$retained_source_entries" \
+                  | jq -c '
+                      map(
+                        select(.catalogEntry.published? != null)
+                        | {
+                            key: (.catalogEntry.version | ascii_downcase),
+                            value: .catalogEntry.published
+                          }
+                      )
+                      | from_entries
+                    '
+              )"
+              publication_metadata="$(
+                printf '%s' "$publication_metadata" \
+                  | jq -c \
+                      --arg package_id "$lower_id" \
+                      --argjson versions "$package_publication_metadata" \
+                      '. + {($package_id): $versions}'
+              )"
+
+              source_versions="$(
+                printf '%s' "$retained_source_entries" \
                   | jq -r '.[].catalogEntry.version? // empty' \
                   | sort -u
               )"
@@ -199,7 +248,7 @@ jobs:
               if [ -n "$new_versions" ]; then
                 target_has_new=true
                 versions_json="$(
-                  printf '%s' "$source_entries" \
+                  printf '%s' "$retained_source_entries" \
                     | jq -c --argjson versions "$(printf '%s\n' "$new_versions" | jq -R . | jq -s .)" '
                         [
                           .[]
@@ -238,6 +287,15 @@ jobs:
 
           echo "changed=${changed}" >> "$GITHUB_OUTPUT"
           printf 'matrix=%s\n' "$matrix_items" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$publication_metadata" > "$PUBLICATION_METADATA_PATH"
+
+      - name: Upload publication metadata artifact
+        if: steps.build-matrix.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: publication-metadata
+          path: ${{ runner.temp }}/publication-metadata.json
+          if-no-files-found: error
 
   # ──────────────────────────────────────────────
   # Download new .nupkg files from GitHub Packages.
@@ -340,6 +398,12 @@ jobs:
           path: ${{ runner.temp }}/metadata
           merge-multiple: true
 
+      - name: Download publication metadata artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: publication-metadata
+          path: ${{ runner.temp }}/publication-metadata
+
       - name: Fetch metadata for unchanged targets
         shell: bash
         env:
@@ -376,10 +440,11 @@ jobs:
           feed-name: "takeshik/nuget-packages"
           packages-path: ${{ runner.temp }}/packages
           metadata-path: ${{ runner.temp }}/metadata
+          publication-metadata-path: ${{ runner.temp }}/publication-metadata/publication-metadata.json
           output-path: ${{ runner.temp }}/site
           package-ids: ${{ steps.package-ids.outputs.package-ids }}
-          retain-stable: '3'
-          retain-prerelease: '30'
+          retain-stable: ${{ env.RETAIN_STABLE }}
+          retain-prerelease: ${{ env.RETAIN_PRERELEASE }}
 
       - name: Configure Pages
         uses: actions/configure-pages@v6

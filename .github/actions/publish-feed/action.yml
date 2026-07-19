@@ -20,6 +20,11 @@ inputs:
       Directory containing per-target metadata JSON files ({id}.json).
       Used to populate the landing page source list.
     required: true
+  publication-metadata-path:
+    description: >
+      JSON file mapping normalized package IDs and versions to their original
+      publication timestamps from the source feed.
+    required: true
   output-path:
     description: >
       Directory where the complete site will be written.
@@ -60,6 +65,7 @@ runs:
         FEED_NAME: ${{ inputs.feed-name }}
         PACKAGES_PATH: ${{ inputs.packages-path }}
         METADATA_PATH: ${{ inputs.metadata-path }}
+        PUBLICATION_METADATA_PATH: ${{ inputs.publication-metadata-path }}
         OUTPUT_PATH: ${{ inputs.output-path }}
         PACKAGE_IDS: ${{ inputs.package-ids }}
         RETAIN_STABLE: ${{ inputs.retain-stable }}
@@ -128,6 +134,33 @@ runs:
         "$sleet" retention prune \
                          --config "$RUNNER_TEMP/sleet.json" --source feed \
                          --stable "$RETAIN_STABLE" --prerelease "$RETAIN_PRERELEASE"
+
+        # Sleet assigns the current time when packages are pushed into a newly
+        # rendered feed. Restore the source feed's original publication time so
+        # rebuilding does not make every retained version look newly published.
+        publication_metadata="$(cat "$PUBLICATION_METADATA_PATH")"
+        while IFS= read -r json_file; do
+          patched_file="$(mktemp)"
+          jq --argjson publication_metadata "$publication_metadata" '
+            walk(
+              if type == "object"
+                 and (.id? | type) == "string"
+                 and (.version? | type) == "string"
+                 and (.published? | type) == "string"
+              then
+                . as $entry
+                | ($publication_metadata
+                    | .[$entry.id | ascii_downcase]
+                    | .[$entry.version | ascii_downcase]) as $published
+                | if $published == null then . else .published = $published end
+              else
+                .
+              end
+            )
+          ' "$json_file" > "$patched_file"
+          mv "$patched_file" "$json_file"
+        done < <(find "$feed_dir" -type f -name '*.json')
+
         "$sleet" validate --config "$RUNNER_TEMP/sleet.json" --source feed
 
         # Copy per-target metadata so the next run can detect unchanged targets.
