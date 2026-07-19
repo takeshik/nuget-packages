@@ -3,6 +3,7 @@
     "Duets",
     "Duets.Jint",
     "Duets.Okojo",
+    "Duets.Pad",
     "HttpHarker"
   ],
   "repositoryUrl": "https://github.com/takeshik/Duets"
