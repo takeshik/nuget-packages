@@ -50,6 +50,7 @@ jobs:
         env:
           FORCE: ${{ inputs.force || 'false' }}
           GH_PACKAGES_SOURCE: https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
+          GH_PACKAGES_API: https://api.github.com/users/${{ github.repository_owner }}/packages/nuget
           GITHUB_TOKEN: ${{ github.token }}
           FEED_BASE_URL: ${{ env.FEED_BASE_URL }}
           RETAIN_STABLE: ${{ env.RETAIN_STABLE }}
@@ -145,6 +146,31 @@ jobs:
             printf '%s' "$entries"
           }
 
+          fetch_package_versions() {
+            local package_id="$1"
+            local encoded_id
+            local page=1
+            local page_payload
+            local page_count
+            local versions='[]'
+            encoded_id="$(jq -rn --arg value "$package_id" '$value | @uri')"
+
+            while :; do
+              page_payload="$(
+                fetch_json "${GH_PACKAGES_API}/${encoded_id}/versions?per_page=100&page=${page}"
+              )" || return $?
+              page_count="$(printf '%s' "$page_payload" | jq 'length')"
+              versions="$(
+                jq -cn --argjson acc "$versions" --argjson items "$page_payload" '$acc + $items'
+              )"
+
+              [ "$page_count" -lt 100 ] && break
+              page=$((page + 1))
+            done
+
+            printf '%s' "$versions"
+          }
+
           matrix_items='[]'
           publication_metadata='{}'
           changed=false
@@ -171,9 +197,10 @@ jobs:
                 exit "$rc"
               fi
 
-              # Registration entries are ordered by NuGet version. Compare only
-              # the versions that survive retention; otherwise pruned versions
-              # look new again on every run.
+              # Compare only the versions that survive retention; otherwise
+              # pruned versions look new again on every run. Do not rely on the
+              # registration response order: GitHub Packages may return pages
+              # whose combined entries are not ordered by NuGet version.
               retained_source_entries="$(
                 printf '%s' "$source_entries" \
                   | jq -c \
@@ -185,27 +212,77 @@ jobs:
                           else .
                           end;
 
+                        def nuget_version_key:
+                          ascii_downcase
+                          | split("+")[0]
+                          | capture(
+                              "^(?<release>[0-9]+(?:\\.[0-9]+){1,3})(?:-(?<prerelease>.*))?$"
+                            )
+                          | (.release | split(".") | map(tonumber) + [0, 0])[:4] as $release
+                          | (
+                              (.prerelease // "")
+                              | if length == 0 then []
+                                else
+                                  split(".")
+                                  | map(
+                                      if test("^[0-9]+$") then [0, tonumber]
+                                      else [1, .]
+                                      end
+                                    )
+                                end
+                            ) as $prerelease
+                          | [$release, $prerelease];
+
                         ([.[] | select(.catalogEntry.version | contains("-") | not)]
+                          | sort_by(.catalogEntry.version | nuget_version_key)
                           | take_last($retain_stable))
                         +
                         ([.[] | select(.catalogEntry.version | contains("-"))]
+                          | sort_by(.catalogEntry.version | nuget_version_key)
                           | take_last($retain_prerelease))
                       '
               )"
 
+              package_versions="$(fetch_package_versions "$pkg_id")"
               package_publication_metadata="$(
-                printf '%s' "$retained_source_entries" \
-                  | jq -c '
-                      map(
-                        select(.catalogEntry.published? != null)
-                        | {
-                            key: (.catalogEntry.version | ascii_downcase),
-                            value: .catalogEntry.published
-                          }
-                      )
-                      | from_entries
-                    '
+                jq -cn \
+                  --argjson retained_entries "$retained_source_entries" \
+                  --argjson package_versions "$package_versions" '
+                    ($retained_entries
+                      | map(.catalogEntry.version | ascii_downcase)) as $retained_versions
+                    | ($package_versions
+                        | map(
+                            select(.name as $version
+                              | $retained_versions
+                              | index($version | ascii_downcase))
+                            | {
+                                key: (.name | ascii_downcase),
+                                value: .created_at
+                              }
+                          )
+                        | from_entries)
+                  '
               )"
+
+              missing_publication_versions="$(
+                jq -nr \
+                  --argjson retained_entries "$retained_source_entries" \
+                  --argjson publication_metadata "$package_publication_metadata" '
+                    $retained_entries
+                    | map(.catalogEntry.version)
+                    | map(select(
+                        . as $version
+                        | $publication_metadata[$version | ascii_downcase] == null
+                      ))
+                    | .[]
+                  '
+              )"
+              if [ -n "$missing_publication_versions" ]; then
+                echo "::error::GitHub Packages did not provide publication timestamps for all retained ${pkg_id} versions:" >&2
+                printf '%s\n' "$missing_publication_versions" >&2
+                exit 1
+              fi
+
               publication_metadata="$(
                 printf '%s' "$publication_metadata" \
                   | jq -c \
